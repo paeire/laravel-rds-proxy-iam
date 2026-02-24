@@ -1,6 +1,5 @@
 {
   "name": "paeire/laravel-rds-proxy-iam",
-  "version": "1.0.0",
   "autoload": {
     "psr-4": {
       "Paeire\\RdsProxyIam\\": "src/"
