@@ -15,19 +15,19 @@ class IamServiceProvider extends ServiceProvider
     }
     public function boot(): void
     {
-        Log::info('[RDSProxy] boot()', [
-            'env' => app()->environment(),
-            'db_default' => config('database.default'),
-            'has_mysql_iam' => isset(config('database.connections')['mysql-iam-proxy']),
-            'db_name' => getenv('DB_USERNAME')
-        ]);
+        //Log::info('[RDSProxy] boot()', [
+        //    'env' => app()->environment(),
+        //    'db_default' => config('database.default'),
+        //    'has_mysql_iam' => isset(config('database.connections')['mysql-iam-proxy']),
+        //    'db_name' => getenv('DB_USERNAME')
+        //]);
 
         /** @var DatabaseManager $db */
         $db = $this->app['db'];
 
         
         $db->extend('mysql-iam-proxy', function ($config, $name) {
-            Log::info('[RDSProxy] extend driver mysql-iam-proxy', ['conn' => $name]);
+            //Log::info('[RDSProxy] extend driver mysql-iam-proxy', ['conn' => $name]);
             $connector = new IamMySqlConnector();
             $pdo = $connector->connect($config);
 
