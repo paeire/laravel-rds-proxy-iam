@@ -13,7 +13,7 @@ connection instead of relying on a static password.
 ## Requirements
 
 - PHP `^8.2`
-- Laravel `10`, `11`, or `12`
+- Laravel `11` or `12`
 - `aws/aws-sdk-php` `^3.300` (installed automatically)
 
 ## Installation
