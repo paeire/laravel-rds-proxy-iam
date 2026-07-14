@@ -4,89 +4,34 @@ declare(strict_types=1);
 
 namespace Paeire\RdsProxyIam;
 
-use Illuminate\Database\DatabaseManager;
+use Illuminate\Database\Connection;
 use Illuminate\Database\MySqlConnection;
 use Illuminate\Support\ServiceProvider;
-use Illuminate\Support\Facades\Log;
 
 class IamServiceProvider extends ServiceProvider
 {
-    private bool $connectorRegistered = false;
-    private bool $driverExtended = false;
+    /**
+     * The database driver name registered by this package.
+     */
+    public const DRIVER = 'mysql-iam-proxy';
 
     public function register(): void
     {
-        $this->registerConnector();
-
-        // Register as early as possible for apps that resolve `db` during container setup.
-        $this->app->beforeResolving('db', function (): void {
-            $this->registerConnector();
+        // Bind the connector under the key Laravel's ConnectionFactory looks up first
+        // (`db.connector.{driver}`). This makes the connector available regardless of
+        // when the `db` manager is resolved.
+        $this->app->singleton('db.connector.'.self::DRIVER, static function (): IamMySqlConnector {
+            return new IamMySqlConnector;
         });
 
-        // Extend the manager immediately after it is resolved.
-        $this->app->afterResolving('db', function (DatabaseManager $db): void {
-            $this->extendDriver($db);
+        // Register the connection resolver on the static registry consulted by
+        // ConnectionFactory::createConnection(). Because this lives in a static registry
+        // (not on the resolved `db` manager), the driver is ready the moment this
+        // provider's register() runs — no matter when the database is first resolved.
+        // The PDO is built lazily by the factory, so the IAM token is generated on first
+        // use rather than at connection resolution time.
+        Connection::resolverFor(self::DRIVER, static function ($pdo, $database, $prefix, array $config): MySqlConnection {
+            return new MySqlConnection($pdo, $database, $prefix, $config);
         });
-
-        if ($this->app->resolved('db')) {
-            /** @var DatabaseManager $db */
-            $db = $this->app->make('db');
-            $this->extendDriver($db);
-            $this->warnIfDatabaseWasResolvedEarly($db);
-        }
-    }
-
-    private function registerConnector(): void
-    {
-        if ($this->connectorRegistered) {
-            return;
-        }
-
-        $this->app->singleton('db.connector.mysql-iam-proxy', static function (): IamMySqlConnector {
-            return new IamMySqlConnector();
-        });
-
-        $this->connectorRegistered = true;
-    }
-
-    private function extendDriver(DatabaseManager $db): void
-    {
-        if ($this->driverExtended) {
-            return;
-        }
-
-        $db->extend('mysql-iam-proxy', function (array $config, string $name): MySqlConnection {
-            $config['name'] = $name;
-
-            /** @var IamMySqlConnector $connector */
-            $connector = $this->app->make('db.connector.mysql-iam-proxy');
-            $pdo = $connector->connect($config);
-
-            return new MySqlConnection(
-                $pdo,
-                $config['database'] ?? null,
-                $config['prefix'] ?? '',
-                $config
-            );
-        });
-
-        $this->driverExtended = true;
-    }
-
-    private function warnIfDatabaseWasResolvedEarly(DatabaseManager $db): void
-    {
-        if (!is_callable([$db, 'getConnections'])) {
-            return;
-        }
-
-        $connections = $db->getConnections();
-        if (count($connections) === 0) {
-            return;
-        }
-
-        Log::warning('[RDSProxyIam] Database connections were opened before IamServiceProvider registration.', [
-            'open_connections' => array_keys($connections),
-            'recommendation' => 'Register this provider before any provider that resolves DB connections.',
-        ]);
     }
 }

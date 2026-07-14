@@ -15,6 +15,15 @@ use Throwable;
 
 class IamMySqlConnector extends MySqlConnector
 {
+    private const DEFAULT_PORT = 3306;
+
+    private const DEFAULT_REGION = 'us-east-1';
+
+    private const DEFAULT_CONNECT_TIMEOUT = 5;
+
+    /**
+     * @param  array<string, mixed>  $config
+     */
     public function connect(array $config): PDO
     {
         $runtimeConfig = $this->normalizeConfig($config);
@@ -27,6 +36,9 @@ class IamMySqlConnector extends MySqlConnector
         return $pdo;
     }
 
+    /**
+     * @param  array<string, mixed>  $config
+     */
     protected function getIamToken(array $config): string
     {
         $provider = CredentialProvider::defaultProvider();
@@ -55,15 +67,19 @@ class IamMySqlConnector extends MySqlConnector
         }
     }
 
-    private function normalizeConfig(array $config): array
+    /**
+     * @param  array<string, mixed>  $config
+     * @return array<string, mixed>
+     */
+    protected function normalizeConfig(array $config): array
     {
         $host = $this->getString($config, ['host', 'DB_HOST']);
-        $port = $this->getInt($config, ['port', 'DB_PORT'], 3306);
+        $port = $this->getInt($config, ['port', 'DB_PORT'], self::DEFAULT_PORT);
         $username = $this->getString($config, ['username', 'DB_USERNAME']);
         $database = $this->getString($config, ['database', 'DB_DATABASE'], allowEmpty: true);
         $tokenHost = $this->getString($config, ['token_host', 'DB_TOKEN_HOST'], $host);
         $tokenPort = $this->getInt($config, ['token_port', 'DB_TOKEN_PORT'], $port);
-        $region = $this->getString($config, ['aws_region', 'AWS_REGION'], 'us-east-1');
+        $region = $this->getString($config, ['aws_region', 'AWS_REGION'], self::DEFAULT_REGION);
 
         if ($host === null) {
             throw new InvalidArgumentException('Missing required database host (host/DB_HOST).');
@@ -91,13 +107,17 @@ class IamMySqlConnector extends MySqlConnector
         ]);
     }
 
-    private function buildOptions(array $config): array
+    /**
+     * @param  array<string, mixed>  $config
+     * @return array<int, mixed>
+     */
+    protected function buildOptions(array $config): array
     {
         $options = $this->getOptions($config);
 
         $sslCa = $this->getString($config, ['ssl_ca', 'DB_SSL_CA'], allowEmpty: true);
         if ($sslCa !== null) {
-            if (!is_readable($sslCa)) {
+            if (! is_readable($sslCa)) {
                 throw new InvalidArgumentException(sprintf('The SSL CA file is not readable: %s', $sslCa));
             }
 
@@ -107,16 +127,16 @@ class IamMySqlConnector extends MySqlConnector
         }
 
         $verifySsl = $this->getBool($config, ['ssl_verify', 'DB_SSL_VERIFY'], true);
-        if (!$verifySsl && defined('PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT')) {
+        if (! $verifySsl && defined('PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT')) {
             $options[PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = false;
         }
 
-        $timeout = $this->getInt($config, ['connect_timeout', 'DB_CONNECT_TIMEOUT'], 5);
+        $timeout = $this->getInt($config, ['connect_timeout', 'DB_CONNECT_TIMEOUT'], self::DEFAULT_CONNECT_TIMEOUT);
         if ($timeout > 0) {
             $options[PDO::ATTR_TIMEOUT] = $timeout;
         }
 
-        if (defined('PDO::ATTR_EMULATE_PREPARES') && !array_key_exists(PDO::ATTR_EMULATE_PREPARES, $options)) {
+        if (defined('PDO::ATTR_EMULATE_PREPARES') && ! array_key_exists(PDO::ATTR_EMULATE_PREPARES, $options)) {
             $options[PDO::ATTR_EMULATE_PREPARES] = false;
         }
 
@@ -134,7 +154,10 @@ class IamMySqlConnector extends MySqlConnector
         return $options;
     }
 
-    private function applySessionConfiguration(PDO $pdo, array $config): void
+    /**
+     * @param  array<string, mixed>  $config
+     */
+    protected function applySessionConfiguration(PDO $pdo, array $config): void
     {
         $forceReadonly = $this->getBool($config, ['force_readonly', 'DB_FORCE_READONLY'], false);
         if ($forceReadonly) {
@@ -147,14 +170,20 @@ class IamMySqlConnector extends MySqlConnector
         }
     }
 
-    private function getSessionInitStatements(array $config): array
+    /**
+     * @param  array<string, mixed>  $config
+     * @return array<int, string>
+     */
+    protected function getSessionInitStatements(array $config): array
     {
         $value = $config['session_init_statements'] ?? $config['DB_SESSION_INIT_STATEMENTS'] ?? null;
         if ($value === null) {
             $value = getenv('DB_SESSION_INIT_STATEMENTS');
         }
 
-        if ($value === false || $value === null || $value === '') {
+        // At this point $value is never null: a null config value was replaced by the
+        // getenv() result (string|false).
+        if ($value === false || $value === '') {
             return [];
         }
 
@@ -162,13 +191,13 @@ class IamMySqlConnector extends MySqlConnector
             $value = array_filter(array_map('trim', explode(';', $value)));
         }
 
-        if (!is_array($value)) {
+        if (! is_array($value)) {
             throw new InvalidArgumentException('session_init_statements must be a string or array.');
         }
 
         $statements = [];
         foreach ($value as $statement) {
-            if (!is_string($statement)) {
+            if (! is_string($statement)) {
                 throw new InvalidArgumentException('session_init_statements entries must be strings.');
             }
 
@@ -181,20 +210,24 @@ class IamMySqlConnector extends MySqlConnector
         return $statements;
     }
 
-    private function getString(array $config, array $keys, ?string $default = null, bool $allowEmpty = false): ?string
+    /**
+     * @param  array<string, mixed>  $config
+     * @param  array<int, string>  $keys
+     */
+    protected function getString(array $config, array $keys, ?string $default = null, bool $allowEmpty = false): ?string
     {
         foreach ($keys as $key) {
-            if (!array_key_exists($key, $config)) {
+            if (! array_key_exists($key, $config)) {
                 continue;
             }
 
             $value = $config[$key];
-            if (!is_scalar($value) && $value !== null) {
+            if (! is_scalar($value) && $value !== null) {
                 throw new InvalidArgumentException(sprintf('Invalid value type for "%s".', $key));
             }
 
             $value = $value === null ? null : trim((string) $value);
-            if ($value === null || (!$allowEmpty && $value === '')) {
+            if ($value === null || (! $allowEmpty && $value === '')) {
                 continue;
             }
 
@@ -208,7 +241,7 @@ class IamMySqlConnector extends MySqlConnector
             }
 
             $envValue = trim((string) $envValue);
-            if (!$allowEmpty && $envValue === '') {
+            if (! $allowEmpty && $envValue === '') {
                 continue;
             }
 
@@ -218,21 +251,29 @@ class IamMySqlConnector extends MySqlConnector
         return $default;
     }
 
-    private function getInt(array $config, array $keys, int $default): int
+    /**
+     * @param  array<string, mixed>  $config
+     * @param  array<int, string>  $keys
+     */
+    protected function getInt(array $config, array $keys, int $default): int
     {
         $value = $this->getString($config, $keys, (string) $default);
 
-        if ($value === null || !is_numeric($value)) {
+        if ($value === null || ! is_numeric($value)) {
             throw new InvalidArgumentException(sprintf('Invalid numeric value for "%s".', $keys[0]));
         }
 
         return (int) $value;
     }
 
-    private function getBool(array $config, array $keys, bool $default): bool
+    /**
+     * @param  array<string, mixed>  $config
+     * @param  array<int, string>  $keys
+     */
+    protected function getBool(array $config, array $keys, bool $default): bool
     {
         foreach ($keys as $key) {
-            if (!array_key_exists($key, $config)) {
+            if (! array_key_exists($key, $config)) {
                 continue;
             }
 
