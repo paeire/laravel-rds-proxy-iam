@@ -10,6 +10,7 @@ use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\DB;
 use Paeire\RdsProxyIam\IamMySqlConnector;
 use Paeire\RdsProxyIam\IamServiceProvider;
+use ReflectionMethod;
 
 class ServiceProviderTest extends TestCase
 {
@@ -54,5 +55,17 @@ class ServiceProviderTest extends TestCase
 
         $this->assertInstanceOf(MySqlConnection::class, $connection);
         $this->assertSame(IamServiceProvider::DRIVER, $connection->getConfig('driver'));
+    }
+
+    public function test_the_bound_connector_treats_only_the_default_connection_as_env_backed(): void
+    {
+        $this->app['config']->set('database.default', 'rds');
+
+        $connector = $this->app->make('db.connector.'.IamServiceProvider::DRIVER);
+        $readsEnvironment = new ReflectionMethod($connector, 'readsEnvironment');
+
+        $this->assertTrue($readsEnvironment->invoke($connector, ['name' => 'rds'], 'DB_HOST'));
+        $this->assertFalse($readsEnvironment->invoke($connector, ['name' => 'reporting'], 'DB_HOST'));
+        $this->assertTrue($readsEnvironment->invoke($connector, ['name' => 'reporting'], 'AWS_REGION'));
     }
 }

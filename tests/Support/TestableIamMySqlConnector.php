@@ -39,4 +39,20 @@ class TestableIamMySqlConnector extends IamMySqlConnector
     {
         return $this->getSessionInitStatements($config);
     }
+
+    /**
+     * @param  array<string, mixed>  $config
+     */
+    public function exposeIamToken(array $config): string
+    {
+        return $this->getIamToken($config);
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     */
+    public function exposeEnsureTls(array $config): void
+    {
+        $this->ensureTls($config);
+    }
 }

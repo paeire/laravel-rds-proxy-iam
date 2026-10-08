@@ -5,11 +5,17 @@ declare(strict_types=1);
 namespace Paeire\RdsProxyIam;
 
 use Aws\Credentials\CredentialProvider;
+use Aws\Credentials\CredentialsInterface;
 use Aws\Rds\AuthTokenGenerator;
+use Closure;
+use Exception;
+use GuzzleHttp\Promise\PromiseInterface;
 use Illuminate\Database\Connectors\MySqlConnector;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
 use PDO;
+use PDOException;
+use ReflectionProperty;
 use RuntimeException;
 use Throwable;
 
@@ -21,29 +27,93 @@ class IamMySqlConnector extends MySqlConnector
 
     private const DEFAULT_CONNECT_TIMEOUT = 5;
 
+    private const TOKEN_LIFETIME_MINUTES = 15;
+
+    private const TOKEN_REUSE_SECONDS = 600;
+
+    private const CREDENTIALS_EXPIRY_MARGIN_SECONDS = 60;
+
+    private const PROXY_HOST_PATTERN = '/\.proxy-[a-z0-9]+\.[a-z0-9-]+\.rds\.amazonaws\.com(\.cn)?$/i';
+
+    private const TLS_OPTIONS = [
+        'PDO::MYSQL_ATTR_SSL_CA',
+        'PDO::MYSQL_ATTR_SSL_CAPATH',
+        'PDO::MYSQL_ATTR_SSL_CERT',
+        'PDO::MYSQL_ATTR_SSL_KEY',
+        'PDO::MYSQL_ATTR_SSL_CIPHER',
+    ];
+
+    private ?Closure $credentials;
+
+    private Closure $clock;
+
+    /** @var array<string, array{token: string, expires: int}> */
+    private array $tokens = [];
+
+    /**
+     * @param  (callable(): PromiseInterface)|null  $credentials  AWS credential provider; defaults to the SDK chain.
+     * @param  (Closure(): int)|null  $clock  Current Unix time.
+     * @param  (Closure(): ?string)|null  $defaultConnection  Name of the default connection, the only one that reads DB_* env vars.
+     */
+    public function __construct(
+        ?callable $credentials = null,
+        private readonly ?AuthTokenGenerator $generator = null,
+        ?Closure $clock = null,
+        private readonly ?Closure $defaultConnection = null,
+    ) {
+        $this->credentials = $credentials === null ? null : Closure::fromCallable($credentials);
+        $this->clock = $clock ?? static fn (): int => time();
+    }
+
     /**
      * @param  array<string, mixed>  $config
      */
     public function connect(array $config): PDO
     {
         $runtimeConfig = $this->normalizeConfig($config);
-        $runtimeConfig['password'] = $this->getIamToken($runtimeConfig);
         $runtimeConfig['options'] = $this->buildOptions($runtimeConfig);
+        $this->ensureTls($runtimeConfig);
 
-        $pdo = parent::connect($runtimeConfig);
+        $token = $this->getIamToken($runtimeConfig);
+
+        try {
+            $pdo = parent::connect([...$runtimeConfig, 'password' => $token]);
+        } catch (Throwable $exception) {
+            $this->forgetIamToken($runtimeConfig);
+
+            if (! $exception instanceof PDOException) {
+                throw $exception;
+            }
+
+            // Rebuilt without the original as $previous: its trace carries the token in the
+            // arguments of Laravel's connector frames whenever zend.exception_ignore_args is off.
+            $sanitized = new PDOException(str_replace($token, '[redacted]', $exception->getMessage()));
+            $sanitized->errorInfo = $exception->errorInfo;
+            (new ReflectionProperty(Exception::class, 'code'))->setValue($sanitized, $exception->getCode());
+
+            throw $sanitized;
+        }
+
         $this->applySessionConfiguration($pdo, $runtimeConfig);
 
         return $pdo;
     }
 
     /**
+     * Tokens are cached per process and reused while they are younger than 10 minutes and
+     * the credentials that signed them have not expired.
+     *
      * @param  array<string, mixed>  $config
      */
     protected function getIamToken(array $config): string
     {
-        $provider = CredentialProvider::defaultProvider();
-        $generator = new AuthTokenGenerator($provider);
         $endpoint = sprintf('%s:%d', $config['token_host'], $config['token_port']);
+        $key = $this->tokenCacheKey($config);
+        $now = ($this->clock)();
+
+        if (isset($this->tokens[$key]) && $this->tokens[$key]['expires'] > $now) {
+            return $this->tokens[$key]['token'];
+        }
 
         try {
             Log::debug('[RDSProxyIam] Generating IAM token', [
@@ -52,7 +122,9 @@ class IamMySqlConnector extends MySqlConnector
                 'endpoint' => $endpoint,
             ]);
 
-            return $generator->createToken($endpoint, $config['aws_region'], $config['username']);
+            $credentials = $this->resolveCredentials();
+            $generator = $this->generator ?? new AuthTokenGenerator($credentials);
+            $token = $generator->createToken($endpoint, $config['aws_region'], $config['username'], self::TOKEN_LIFETIME_MINUTES);
         } catch (Throwable $exception) {
             throw new RuntimeException(
                 sprintf(
@@ -65,6 +137,41 @@ class IamMySqlConnector extends MySqlConnector
                 $exception
             );
         }
+
+        $expires = $now + self::TOKEN_REUSE_SECONDS;
+        $credentialsExpiration = $credentials->getExpiration();
+        if ($credentialsExpiration !== null) {
+            $expires = min($expires, (int) $credentialsExpiration - self::CREDENTIALS_EXPIRY_MARGIN_SECONDS);
+        }
+
+        $this->tokens[$key] = ['token' => $token, 'expires' => $expires];
+
+        return $token;
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     */
+    protected function forgetIamToken(array $config): void
+    {
+        unset($this->tokens[$this->tokenCacheKey($config)]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     */
+    private function tokenCacheKey(array $config): string
+    {
+        return sprintf('%s:%d|%s|%s', $config['token_host'], $config['token_port'], $config['aws_region'], $config['username']);
+    }
+
+    private function resolveCredentials(): CredentialsInterface
+    {
+        // defaultProvider() memoizes internally, so keeping one instance per process means
+        // IMDS/STS are only hit again when the credentials expire.
+        $this->credentials ??= Closure::fromCallable(CredentialProvider::defaultProvider());
+
+        return ($this->credentials)()->wait();
     }
 
     /**
@@ -79,7 +186,7 @@ class IamMySqlConnector extends MySqlConnector
         $database = $this->getString($config, ['database', 'DB_DATABASE'], allowEmpty: true);
         $tokenHost = $this->getString($config, ['token_host', 'DB_TOKEN_HOST'], $host);
         $tokenPort = $this->getInt($config, ['token_port', 'DB_TOKEN_PORT'], $port);
-        $region = $this->getString($config, ['aws_region', 'AWS_REGION'], self::DEFAULT_REGION);
+        $region = $this->getString($config, ['aws_region', 'region', 'AWS_REGION'], self::DEFAULT_REGION);
 
         if ($host === null) {
             throw new InvalidArgumentException('Missing required database host (host/DB_HOST).');
@@ -140,18 +247,58 @@ class IamMySqlConnector extends MySqlConnector
             $options[PDO::ATTR_EMULATE_PREPARES] = false;
         }
 
-        $enableCleartext = $this->getBool($config, ['enable_cleartext_plugin'], true);
-        if ($enableCleartext) {
-            if (defined('PDO::MYSQL_ATTR_DEFAULT_AUTH')) {
-                $options[PDO::MYSQL_ATTR_DEFAULT_AUTH] = 'mysql_clear_password';
-            }
-
-            if (getenv('MYSQL_ENABLE_CLEARTEXT_PLUGIN') !== '1') {
-                putenv('MYSQL_ENABLE_CLEARTEXT_PLUGIN=1');
-            }
+        // Only pdo_mysql builds linked against libmysqlclient read this; mysqlnd answers the
+        // server's mysql_clear_password auth switch on its own.
+        if ($this->getBool($config, ['enable_cleartext_plugin'], true) && getenv('MYSQL_ENABLE_CLEARTEXT_PLUGIN') !== '1') {
+            putenv('MYSQL_ENABLE_CLEARTEXT_PLUGIN=1');
         }
 
         return $options;
+    }
+
+    /**
+     * AWS rejects IAM authentication through RDS Proxy without TLS, so a proxy endpoint
+     * requires it unless `require_tls` is explicitly disabled.
+     *
+     * @param  array<string, mixed>  $config
+     */
+    protected function ensureTls(array $config): void
+    {
+        $isProxy = preg_match(self::PROXY_HOST_PATTERN, (string) $config['token_host']) === 1;
+        $required = $this->getBool($config, ['require_tls', 'DB_REQUIRE_TLS'], $isProxy);
+
+        if ($this->usesTls($config['options'] ?? [])) {
+            return;
+        }
+
+        if ($required) {
+            throw new InvalidArgumentException(sprintf(
+                'Connection "%s" (%s) requires TLS but none is configured. Set ssl_ca (DB_SSL_CA) to the Amazon RDS CA bundle, or set require_tls to false.',
+                $config['name'] ?? 'default',
+                $config['token_host'],
+            ));
+        }
+
+        if ($isProxy) {
+            Log::warning('[RDSProxyIam] TLS is disabled for an RDS Proxy connection; AWS requires TLS for IAM authentication through a proxy.', [
+                'connection' => $config['name'] ?? null,
+                'endpoint' => $config['token_host'],
+            ]);
+        }
+    }
+
+    /**
+     * @param  array<int, mixed>  $options
+     */
+    private function usesTls(array $options): bool
+    {
+        foreach (self::TLS_OPTIONS as $option) {
+            if (defined($option) && ! empty($options[constant($option)])) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -178,11 +325,11 @@ class IamMySqlConnector extends MySqlConnector
     {
         $value = $config['session_init_statements'] ?? $config['DB_SESSION_INIT_STATEMENTS'] ?? null;
         if ($value === null) {
-            $value = getenv('DB_SESSION_INIT_STATEMENTS');
+            $value = $this->readsEnvironment($config, 'DB_SESSION_INIT_STATEMENTS')
+                ? getenv('DB_SESSION_INIT_STATEMENTS')
+                : false;
         }
 
-        // At this point $value is never null: a null config value was replaced by the
-        // getenv() result (string|false).
         if ($value === false || $value === '') {
             return [];
         }
@@ -211,6 +358,30 @@ class IamMySqlConnector extends MySqlConnector
     }
 
     /**
+     * DB_* variables describe the default connection, so any other connection reads only
+     * its own config and never inherits the default's host, user or token endpoint.
+     *
+     * @param  array<string, mixed>  $config
+     */
+    protected function readsEnvironment(array $config, string $key): bool
+    {
+        if ($key !== strtoupper($key)) {
+            return false;
+        }
+
+        if (! str_starts_with($key, 'DB_')) {
+            return true;
+        }
+
+        $name = $config['name'] ?? null;
+        if ($name === null || $this->defaultConnection === null) {
+            return true;
+        }
+
+        return $name === ($this->defaultConnection)();
+    }
+
+    /**
      * @param  array<string, mixed>  $config
      * @param  array<int, string>  $keys
      */
@@ -235,6 +406,10 @@ class IamMySqlConnector extends MySqlConnector
         }
 
         foreach ($keys as $key) {
+            if (! $this->readsEnvironment($config, $key)) {
+                continue;
+            }
+
             $envValue = getenv($key);
             if ($envValue === false) {
                 continue;
@@ -281,6 +456,10 @@ class IamMySqlConnector extends MySqlConnector
         }
 
         foreach ($keys as $key) {
+            if (! $this->readsEnvironment($config, $key)) {
+                continue;
+            }
+
             $envValue = getenv($key);
             if ($envValue === false) {
                 continue;
