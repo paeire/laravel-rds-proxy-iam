@@ -16,6 +16,7 @@ class ConnectorOptionsTest extends TestCase
     private const ENV_KEYS = [
         'connect_timeout', 'DB_CONNECT_TIMEOUT', 'ssl_ca', 'DB_SSL_CA',
         'ssl_verify', 'DB_SSL_VERIFY', 'enable_cleartext_plugin',
+        'MYSQL_ENABLE_CLEARTEXT_PLUGIN',
     ];
 
     protected function setUp(): void
@@ -57,15 +58,11 @@ class ConnectorOptionsTest extends TestCase
         $this->assertFalse($options[PDO::ATTR_EMULATE_PREPARES]);
     }
 
-    public function test_it_enables_the_cleartext_auth_plugin_by_default(): void
+    public function test_it_enables_the_cleartext_plugin_for_libmysqlclient_builds(): void
     {
-        if (! defined('PDO::MYSQL_ATTR_DEFAULT_AUTH')) {
-            $this->markTestSkipped('pdo_mysql is not available.');
-        }
+        $this->connector()->exposeBuildOptions([]);
 
-        $options = $this->connector()->exposeBuildOptions([]);
-
-        $this->assertSame('mysql_clear_password', $options[PDO::MYSQL_ATTR_DEFAULT_AUTH]);
+        $this->assertSame('1', getenv('MYSQL_ENABLE_CLEARTEXT_PLUGIN'));
     }
 
     public function test_it_can_disable_server_certificate_verification(): void

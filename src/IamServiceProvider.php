@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Paeire\RdsProxyIam;
 
+use Illuminate\Contracts\Container\Container;
 use Illuminate\Database\Connection;
 use Illuminate\Database\MySqlConnection;
 use Illuminate\Support\ServiceProvider;
@@ -19,9 +20,12 @@ class IamServiceProvider extends ServiceProvider
     {
         // Bind the connector under the key Laravel's ConnectionFactory looks up first
         // (`db.connector.{driver}`). This makes the connector available regardless of
-        // when the `db` manager is resolved.
-        $this->app->singleton('db.connector.'.self::DRIVER, static function (): IamMySqlConnector {
-            return new IamMySqlConnector;
+        // when the `db` manager is resolved. It is a singleton so the IAM token and AWS
+        // credentials it caches live for the whole process; an app can bind its own first.
+        $this->app->singletonIf('db.connector.'.self::DRIVER, static function (Container $app): IamMySqlConnector {
+            return new IamMySqlConnector(
+                defaultConnection: static fn (): ?string => $app->make('config')->get('database.default'),
+            );
         });
 
         // Register the connection resolver on the static registry consulted by
